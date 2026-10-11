@@ -20,8 +20,11 @@ import base64
 import datetime as _dt
 import json
 import logging
+import re
 from email import message_from_bytes
+from email.parser import BytesHeaderParser
 from email.policy import compat32
+from email.utils import getaddresses
 
 from sqlalchemy import select, update
 
@@ -30,6 +33,7 @@ from common.audit import record as audit_record
 from common.constants import QUEUE_BACKOFF_SECONDS, QUEUE_MAX_ATTEMPTS_DEFAULT
 from common.db import session_scope
 from common.graph_client import GraphClient, GraphError, credential_fingerprint
+from common.routing import resolve_route
 from common.models import (
     AuditEventType,
     AuditOutcome,
@@ -57,8 +61,13 @@ async def enqueue(
     raw_mime: bytes,
     source_ip: str | None,
     source_username: str | None,
+    app_id: int | None = None,
 ) -> int:
-    """Persist one incoming message. Returns the new queue id."""
+    """Persist one incoming message. Returns the new queue id.
+
+    `app_id` is the enterprise app chosen at MAIL FROM; None leaves the
+    choice to the worker (routed by sender domain at send time).
+    """
     subject = _extract_subject(raw_mime)
     encoded = base64.b64encode(raw_mime).decode("ascii")
 
@@ -73,6 +82,7 @@ async def enqueue(
             next_attempt_at=_utcnow(),
             source_ip=source_ip,
             source_username=source_username,
+            tenant_config_id=app_id,
         )
         session.add(row)
         await session.flush()
@@ -88,6 +98,91 @@ def _extract_subject(raw_mime: bytes) -> str | None:
     except Exception:
         return None
     return None
+
+
+# -----------------------------------------------------------------------------
+# Envelope-only recipients (BCC)
+# -----------------------------------------------------------------------------
+
+# A bare addr-spec we are willing to write into a header: no whitespace,
+# control characters or address-list/header syntax that could break out of
+# the Bcc field. Anything else is skipped (and logged), never written.
+_SAFE_ADDR = re.compile(r'^[^\s\x00-\x1f\x7f@<>,;:"()\[\]\\]+@[^\s\x00-\x1f\x7f@<>,;:"()\[\]\\]+$')
+_BCC_FIELD = re.compile(rb"^bcc[ \t]*:", re.IGNORECASE)
+
+
+def _split_headers(raw_mime: bytes) -> tuple[bytes, bytes]:
+    """Split raw MIME into (header block, rest) at the first blank line.
+
+    The header block keeps its trailing line ending; `rest` starts with the
+    blank line, so `head + rest == raw_mime`.
+    """
+    candidates = [i for i in (raw_mime.find(b"\r\n\r\n"), raw_mime.find(b"\n\n")) if i >= 0]
+    if not candidates:
+        return raw_mime, b""
+    cut = min(candidates)
+    # Keep the header block's own final line ending with the headers.
+    cut += 2 if raw_mime.startswith(b"\r\n", cut) else 1
+    return raw_mime[:cut], raw_mime[cut:]
+
+
+def with_envelope_bcc(raw_mime: bytes, recipients: list[str]) -> bytes:
+    """Return `raw_mime` with envelope-only recipients added as a Bcc header.
+
+    An SMTP client sends a blind copy by listing the address in RCPT TO and
+    leaving it out of the headers. Graph's MIME sendMail takes recipients
+    from the To/Cc/Bcc headers and has no notion of the SMTP envelope, so
+    such addresses would be silently dropped. Every envelope recipient not
+    already named in To/Cc/Bcc is therefore added to a single Bcc header
+    (merged with any Bcc the client wrote); Exchange delivers to it and
+    strips it from the copies recipients receive. The rest of the message
+    is left byte-for-byte untouched.
+    """
+    head, rest = _split_headers(raw_mime)
+    try:
+        msg = BytesHeaderParser(policy=compat32).parsebytes(head)
+        listed = getaddresses(
+            [str(v) for name in ("To", "Cc", "Bcc") for v in (msg.get_all(name) or [])]
+        )
+        existing_bcc = [
+            addr for _, addr in getaddresses([str(v) for v in (msg.get_all("Bcc") or [])])
+        ]
+    except Exception as exc:
+        _log.warning("Could not parse headers to add BCC recipients: %s", exc)
+        return raw_mime
+
+    seen = {addr.casefold() for _, addr in listed if addr}
+    missing: list[str] = []
+    for rcpt in recipients:
+        key = rcpt.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if _SAFE_ADDR.match(rcpt):
+            missing.append(rcpt)
+        else:
+            _log.warning("Skipping envelope recipient unsafe for a Bcc header: %r", rcpt)
+    if not missing:
+        return raw_mime
+
+    eol = b"\r\n" if b"\r\n" in head else b"\n"
+    bcc = [a for a in existing_bcc if _SAFE_ADDR.match(a)] + missing
+
+    # Drop any existing Bcc field (with its folded continuation lines) so the
+    # result carries exactly one, as RFC 5322 requires.
+    kept: list[bytes] = []
+    skipping = False
+    for line in head.splitlines(keepends=True):
+        if line[:1] in (b" ", b"\t"):
+            if not skipping:
+                kept.append(line)
+            continue
+        skipping = bool(_BCC_FIELD.match(line))
+        if not skipping:
+            kept.append(line)
+
+    field = b"Bcc: " + (b"," + eol + b" ").join(a.encode("utf-8") for a in bcc) + eol
+    return field + b"".join(kept) + rest
 
 
 # -----------------------------------------------------------------------------
@@ -131,9 +226,9 @@ class QueueWorker:
         self._poll = poll_interval_seconds
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        # Cache a GraphClient per (tenant_id, client_id). Rebuilt when
-        # the tenant config changes.
-        self._graph: GraphClient | None = None
+        # One cached GraphClient per enterprise app id, each rebuilt when
+        # that app's credential changes.
+        self._graph: dict[int, GraphClient] = {}
 
     # Lifecycle ---------------------------------------------------------
 
@@ -196,32 +291,50 @@ class QueueWorker:
 
     # Per-message processing -------------------------------------------
 
-    async def _graph_client(self) -> GraphClient:
-        """Return a cached GraphClient for the currently-configured tenant.
+    async def _graph_client(self, app_id: int) -> GraphClient:
+        """Return a cached GraphClient for enterprise app `app_id`.
 
-        The client is rebuilt whenever the active credential changes — a
-        secret rotation, a certificate activation, or a different tenant/
+        The client is rebuilt whenever the app's active credential changes —
+        a secret rotation, a certificate activation, or a different tenant/
         client id — detected via `credential_fingerprint` without decrypting
         anything. Building happens inside the session so the row's encrypted
         material is still loaded.
         """
         async with session_scope() as session:
-            cfg = await session.scalar(
-                select(TenantConfig).where(TenantConfig.id == 1)
-            )
-            if cfg is None or not cfg.tenant_id or not cfg.client_id:
+            cfg = await session.get(TenantConfig, app_id)
+            if cfg is None:
+                self._graph.pop(app_id, None)
                 raise GraphError(
-                    "Entra tenant configuration is missing. Configure it "
-                    "in the UI before enabling the relay."
+                    f"Enterprise app #{app_id} no longer exists."
                 )
-            if (
-                self._graph is not None
-                and self._graph.fingerprint == credential_fingerprint(cfg)
-            ):
-                return self._graph
+            if not cfg.tenant_id or not cfg.client_id:
+                raise GraphError(
+                    f"Enterprise app {cfg.name!r} is not configured. "
+                    "Configure it in the UI before sending through it."
+                )
+            cached = self._graph.get(app_id)
+            if cached is not None and cached.fingerprint == credential_fingerprint(cfg):
+                return cached
             # Raises GraphError if the selected credential has no material.
-            self._graph = GraphClient.from_tenant_config(cfg)
-        return self._graph
+            client = GraphClient.from_tenant_config(cfg)
+            self._graph[app_id] = client
+        return client
+
+    async def _route_row(self, row_id: int, sender: str) -> int:
+        """Pick (and remember) the app for a row queued without one."""
+        async with session_scope() as session:
+            route = await resolve_route(session, sender)
+            if not route.ok:
+                raise GraphError(
+                    "No enterprise app for this sender: its domain is not "
+                    "mapped and unmapped domains are refused."
+                    if route.via == "unmapped"
+                    else "No default enterprise app is configured."
+                )
+            row = await session.get(MailQueue, row_id)
+            if row is not None:
+                row.tenant_config_id = route.app.id
+            return route.app.id
 
     async def _process(self, row_id: int) -> None:
         # 1. Load the row.
@@ -230,6 +343,9 @@ class QueueWorker:
             if row is None:
                 return
             raw = base64.b64decode(row.raw_mime_b64.encode("ascii"))
+            # Done at send time (not enqueue) so the stored message stays as
+            # received, and rows queued before this fix also get their BCCs.
+            raw = with_envelope_bcc(raw, json.loads(row.recipients_json or "[]"))
             sender = row.sender
             subject = row.subject
             attempts = row.attempts + 1
@@ -241,13 +357,16 @@ class QueueWorker:
             )
             source_ip = row.source_ip
             source_username = row.source_username
+            app_id = row.tenant_config_id
 
         # 2. Try to send via Graph. Token acquisition errors + Graph
         # errors both surface as GraphError.
         graph_error: str | None = None
         graph_exc: GraphError | None = None
         try:
-            client = await self._graph_client()
+            if app_id is None:
+                app_id = await self._route_row(row_id, sender)
+            client = await self._graph_client(app_id)
             await asyncio.to_thread(client.send_mime, sender, raw)
         except GraphError as exc:
             graph_error = str(exc)
@@ -265,7 +384,9 @@ class QueueWorker:
             row.last_attempt = now
 
             if graph_error is None:
-                # Success: write .eml, record archive path, mark SENT.
+                # Success: write .eml, record archive path, mark SENT. The
+                # archived copy is what Graph received, Bcc header included,
+                # so the evidence (and an archive resend) keeps blind copies.
                 try:
                     path = await asyncio.to_thread(
                         archive.write_eml,
@@ -313,6 +434,7 @@ class QueueWorker:
                         "queue_id": row.id,
                         "sender": sender,
                         "recipients": json.loads(row.recipients_json),
+                        "app_id": app_id,
                     },
                 )
 
@@ -320,9 +442,7 @@ class QueueWorker:
                 # so the dashboard reflects a healthy Graph connection.
                 try:
                     info = client.acquire_token()
-                    cfg = await session.scalar(
-                        select(TenantConfig).where(TenantConfig.id == 1)
-                    )
+                    cfg = await session.get(TenantConfig, app_id)
                     if cfg is not None:
                         cfg.last_token_acquired_at = now
                         cfg.last_token_expires_at = info.expires_at.replace(
@@ -345,6 +465,7 @@ class QueueWorker:
                 details={
                     "queue_id": row.id,
                     "sender": sender,
+                    "app_id": app_id,
                     "attempts": attempts,
                     "transient": transient,
                     "error": graph_error[:500],
