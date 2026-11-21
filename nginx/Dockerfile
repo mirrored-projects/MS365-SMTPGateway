@@ -10,20 +10,25 @@
 # reachable over HTTPS. To use a real certificate, mount the two files
 # into the `certs` volume before starting the stack.
 #
-# The image is based on nginxinc/nginx-unprivileged so the process runs as
+# The image is based on nginx/nginx-unprivileged so the process runs as
 # a non-root user (uid 101) and listens on high ports (8080/8443). The
 # compose file maps the conventional host ports 80/443 onto those.
+# (nginx moved it on Docker Hub from nginxinc/nginx-unprivileged, which has
+# received no rebuild since 2026-10-19 - nginx/docker-nginx-unprivileged#434.)
 # =============================================================================
 
 # Base image pinned by digest for reproducible builds and supply-chain safety.
 # The tag is kept for readability; Docker resolves the digest. Digest bumps are
 # automated via Dependabot (.github/dependabot.yml).
-FROM nginxinc/nginx-unprivileged:1.31-alpine@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e
+FROM nginx/nginx-unprivileged:1.31-alpine@sha256:60214a103e6f38e953ff957f34b1f2e97a9db801ab2df3821da955d0fe6cadd6
 
 # The unprivileged base image runs as uid 101 ("nginx"). Switch to root only
 # for the build steps that need it, then drop back.
 USER root
 
+# - apk upgrade: Alpine security fixes released after the base image was
+#   built (it is not rebuilt for each one). Patch releases of the image's
+#   Alpine branch only; nginx itself comes from nginx.org and is not touched.
 # - openssl: required by the self-signed-cert entrypoint (absent from the
 #   alpine base image).
 # - /etc/nginx/certs owned by uid 101: a freshly created `certs` named volume
@@ -33,7 +38,8 @@ USER root
 # - remove the stock default server so the base image's
 #   10-listen-on-ipv6-on-ipv4 entrypoint exits early instead of rewriting it
 #   in place (which would fail on a read-only root filesystem).
-RUN apk add --no-cache openssl \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache openssl \
     && mkdir -p /etc/nginx/certs \
     && chown 101:101 /etc/nginx/certs \
     && rm -f /etc/nginx/conf.d/default.conf
