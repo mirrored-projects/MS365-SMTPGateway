@@ -2,7 +2,7 @@
 # Trivy ignore list — accepted base-image vulnerabilities
 # =============================================================================
 # These CVEs originate from the Debian bookworm base of python:3.12-slim-bookworm
-# (shared by the relay and ui images). All six have NO fixed Debian version
+# (shared by the relay and ui images). Both have NO fixed Debian version
 # available, so they cannot be resolved by patching, `apt-get upgrade`, or
 # rebasing onto a newer base-image digest. They are accepted as documented risk —
 # the "Known Accepted Risks" table in SECURITY.md carries the full rationale and
@@ -12,8 +12,9 @@
 # the fork-docker-build reusable workflow runs `trivy image` there, so listed
 # CVEs are removed from the report before the CRITICAL gate counts them.
 #
-# Reviewed:      2026-07-02
-# Next review:   2026-10-02  (re-check whether Debian shipped fixes; drop entries)
+# Reviewed:      2026-11-22  (dropped the four perl-base entries: Trivy no longer
+#                reports them on the bookworm images at any severity)
+# Next review:   2027-02-22  (re-check whether Debian shipped fixes; drop entries)
 # Owner:         kb@de.bauer-group.com
 # -----------------------------------------------------------------------------
 
@@ -22,38 +23,6 @@
 # Debian's zlib1g, so the library as shipped is not affected. Never fixed upstream.
 CVE-2023-45853
 
-# perl-base — heap buffer overflow compiling regexes on 32-bit builds only.
-# Not applicable: the images are built for amd64 (64-bit). No fix available.
-CVE-2026-8376
-
-# perl-base — path traversal in Archive::Tar via crafted symlinks.
-# Debian status: fix_deferred (no fix yet). relay/ui do not use Archive::Tar.
-CVE-2026-42496
-
-# perl-base — 16-bit overflow in Perl_study_chunk: an alternation of more than
-# 65535 fixed-string branches compiled into a trie silently truncates the match
-# table, yielding false positive/negative matches. Rated CRITICAL because it can
-# undermine regex-based access control — in Perl code.
-# Not applicable: nothing in relay/ui executes Perl at all; perl-base is only a
-# transitive part of the Debian base image (the Alpine-based nginx image carries
-# no perl and scans clean). Reaching the defect would additionally require a
-# regex with >65535 fixed-string branches, which exists nowhere here.
-# Fixed upstream in Perl 5.43.10; Debian bookworm is unfixed and so is sid, so
-# no base-image digest bump or apt upgrade can resolve it.
-CVE-2026-13221
-
 # libsqlite3-0 — SQLite integer overflow. Status: affected, no fixed Debian
 # version available. Re-evaluate on next review once Debian ships a patch.
 CVE-2025-7458
-
-# perl-base — signed integer overflow in Storable (< 3.41): deserializing a
-# crafted SX_HOOK record panics. Rated CRITICAL because Storable::thaw on
-# attacker-controlled blobs is a classic deserialization sink — in Perl code.
-# Not applicable: same reasoning as CVE-2026-13221 — nothing in relay/ui
-# executes Perl, and no Storable blob (trusted or not) is ever deserialized;
-# perl-base is only a transitive part of the Debian base image.
-# Debian bookworm ships 5.36.0-7+deb12u3 and is unfixed; trixie is unfixed too.
-# Only sid/forky (perl 5.42.2-3) carries the fix, so no digest bump or
-# apt-get upgrade on a bookworm base can resolve it.
-# Added: 2026-08-01
-CVE-2026-57433

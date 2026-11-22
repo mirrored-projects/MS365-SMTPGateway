@@ -25,18 +25,17 @@ rebuilds.
 
 | CVE | Package | Severity | Status |
 |---|---|---|---|
-| CVE-2026-0861 | glibc | HIGH | No fix available |
 | CVE-2025-69720 | ncurses | HIGH | No fix available |
 | CVE-2025-7458 | libsqlite3 | CRITICAL | No fix available |
-| CVE-2026-29111 | systemd | HIGH | No fix available |
 | CVE-2023-45853 | zlib | CRITICAL | `will_not_fix` — not exploitable in this context |
-| CVE-2026-8376 | perl-base | CRITICAL | `affected` — 32-bit builds only; images are 64-bit |
-| CVE-2026-42496 | perl-base | CRITICAL | `fix_deferred` — Archive::Tar path traversal, module not used |
-| CVE-2026-13221 | perl-base | CRITICAL | `affected` — Perl_study_chunk trie overflow; no Perl is executed |
-| CVE-2026-57433 | perl-base | CRITICAL | `affected` — Storable SX_HOOK overflow; no Storable blob is read |
 
-All Python dependency CVEs have been resolved. The image is rebuilt periodically
-to pick up OS-level patches as they are released by Debian.
+The only remaining Python finding is setuptools 70.3.0 vendored inside pip
+(`pip/_vendor`, used for `pkg_resources`). CVE-2025-47273 concerns
+`setuptools.package_index`, which pip does not ship; it clears once pip updates
+its vendored copy. The image is rebuilt periodically to pick up OS-level
+patches as they are released by Debian.
+
+Last reviewed: 2026-11-22.
 
 These accepted CVEs are also listed in [`.trivyignore`](.trivyignore) so that a
 Trivy scan configured to fail on CRITICAL findings passes with the risk
