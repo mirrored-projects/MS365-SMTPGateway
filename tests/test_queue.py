@@ -14,12 +14,26 @@ from common.models import (
     MailQueue,
     MailStatus,
     Settings,
+    TenantConfig,
 )
 from relay import queue_manager
 
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
+async def _setup(max_attempts: int = 3) -> None:
+    """Settings plus the default enterprise app that unrouted rows go to.
+
+    Rows queued without an app are routed by sender domain when they are
+    sent, so without a default app every send fails with "No default
+    enterprise app is configured." before the stubbed Graph client runs.
+    """
+    async with session_scope() as s:
+        s.add(Settings(id=1, queue_max_attempts=max_attempts))
+        s.add(TenantConfig(id=1, name="Default", is_default=True,
+                           tenant_id="tenant", client_id="client"))
 
 
 async def _add(**kwargs) -> int:
@@ -59,13 +73,13 @@ async def test_reaper_recovers_sending(db):
 
 
 async def test_transient_stays_pending_and_honours_retry_after(db):
-    async with session_scope() as s:
-        s.add(Settings(id=1, queue_max_attempts=3))
+    await _setup()
     rid = await _add(status=MailStatus.PENDING, attempts=3, next_attempt_at=_utcnow())
 
     worker = queue_manager.QueueWorker()
 
-    async def gc():
+    async def gc(app_id):
+        assert app_id == 1  # routed to the default app
         return _Fail(GraphError("throttled", status_code=429,
                                 retry_after=120, transient=True))
     worker._graph_client = gc
@@ -79,29 +93,31 @@ async def test_transient_stays_pending_and_honours_retry_after(db):
 
 
 async def test_permanent_failure_dead_at_max(db):
-    async with session_scope() as s:
-        s.add(Settings(id=1, queue_max_attempts=3))
+    await _setup()
     rid = await _add(status=MailStatus.PENDING, attempts=3, next_attempt_at=_utcnow())
 
     worker = queue_manager.QueueWorker()
 
-    async def gc():
+    async def gc(app_id):
+        assert app_id == 1  # routed to the default app
         return _Fail(GraphError("bad recipient", status_code=550, transient=False))
     worker._graph_client = gc
 
     await worker._process(rid)
     async with session_scope() as s:
-        assert (await s.get(MailQueue, rid)).status == MailStatus.DEAD
+        row = await s.get(MailQueue, rid)
+        assert row.status == MailStatus.DEAD
+        assert "bad recipient" in row.last_error  # the 550, not a routing error
 
 
 async def test_archive_failure_audited_but_still_sent(db, monkeypatch):
-    async with session_scope() as s:
-        s.add(Settings(id=1, queue_max_attempts=3))
+    await _setup()
     rid = await _add(status=MailStatus.PENDING, attempts=0, next_attempt_at=_utcnow())
 
     worker = queue_manager.QueueWorker()
 
-    async def gc():
+    async def gc(app_id):
+        assert app_id == 1  # routed to the default app
         return _OK()
     worker._graph_client = gc
 
