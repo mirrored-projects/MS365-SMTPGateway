@@ -29,10 +29,13 @@ rebuilds.
 | CVE-2025-7458 | libsqlite3 | CRITICAL | No fix available |
 | CVE-2023-45853 | zlib | CRITICAL | `will_not_fix` — not exploitable in this context |
 
-The only remaining Python finding is setuptools 70.3.0 vendored inside pip
-(`pip/_vendor`, used for `pkg_resources`). CVE-2025-47273 concerns
-`setuptools.package_index`, which pip does not ship; it clears once pip updates
-its vendored copy. The image is rebuilt periodically to pick up OS-level
+The only remaining Python findings are three advisories against setuptools
+70.3.0 vendored inside pip (`pip/_vendor`, used for `pkg_resources`):
+CVE-2025-47273 (HIGH, path traversal in `setuptools.package_index`, which pip
+does not ship), CVE-2026-59890 (MEDIUM, sdist building) and
+GHSA-xmj3-9gf7-h52w (LOW, legacy wheel installation on Windows). None of these
+code paths runs in the Linux images; they clear once pip updates its vendored
+copy. The image is rebuilt periodically to pick up OS-level
 patches as they are released by Debian.
 
 Last reviewed: 2026-11-22.
