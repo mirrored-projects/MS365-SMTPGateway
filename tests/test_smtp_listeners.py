@@ -93,3 +93,16 @@ async def test_starttls_listener_offers_auth_only_after_tls(listeners):
 
     assert await asyncio.to_thread(run) == (False, True, 535)
 
+
+async def test_implicit_tls_listener_offers_auth(listeners):
+    # Before the fix EHLO hid AUTH on 465 and AUTH got "538 Encryption
+    # required", although the connection is TLS from the first byte.
+    def run():
+        ctx = _client_tls(listeners["cert_pem"])
+        with smtplib.SMTP_SSL(
+            "127.0.0.1", listeners["implicit"], context=ctx, timeout=10
+        ) as s:
+            s.ehlo()
+            return s.has_extn("auth"), _bad_login(s)
+
+    assert await asyncio.to_thread(run) == (True, 535)

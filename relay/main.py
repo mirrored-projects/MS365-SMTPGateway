@@ -280,9 +280,9 @@ def build_smtp_controllers(handler, authenticator) -> list[Controller]:
 
     Always includes a plaintext listener for internal LAN clients. When
     a TLS certificate is configured it also returns a STARTTLS
-    submission listener (587) and an implicit-TLS SMTPS listener (465),
-    both of which require AUTH to happen over TLS. Callers start()/stop()
-    each controller.
+    submission listener (587, AUTH only after STARTTLS) and an implicit-TLS
+    SMTPS listener (465, TLS from the first byte), so AUTH on either one
+    always happens over TLS. Callers start()/stop() each controller.
     """
     base = build_controller_kwargs()
     hostname = base["hostname"]
@@ -316,6 +316,10 @@ def build_smtp_controllers(handler, authenticator) -> list[Controller]:
             )
         )
         # 465: implicit TLS (SMTPS) — the socket is TLS from the start.
+        # auth_require_tls stays off here: aiosmtpd only recognises TLS
+        # negotiated via STARTTLS, so with it on, EHLO hides AUTH and AUTH
+        # gets "538 Encryption required" although the session is already
+        # encrypted. Plaintext cannot reach this listener at all.
         controllers.append(
             _CaseInsensitiveController(
                 handler,
@@ -324,7 +328,7 @@ def build_smtp_controllers(handler, authenticator) -> list[Controller]:
                 ssl_context=tls_ctx,
                 authenticator=authenticator,
                 auth_required=False,
-                auth_require_tls=True,
+                auth_require_tls=False,
             )
         )
     return controllers

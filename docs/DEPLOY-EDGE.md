@@ -25,8 +25,9 @@ itself (465 + 587) and the edge only passes the TCP stream through.
 
 - **Web UI:** edge terminates TLS, proxies plain HTTP to the UI.
 - **SMTP 465/587:** edge does **TCP passthrough** (Traefik/Caddy cannot speak
-  STARTTLS themselves); the relay presents the certificate and enforces
-  `auth_require_tls`, so credentials are never sent in clear.
+  STARTTLS themselves); the relay presents the certificate. 587 accepts AUTH
+  only after STARTTLS (`auth_require_tls`) and 465 is TLS from the first byte,
+  so credentials are never sent in clear.
 - **SMTP 2525:** plaintext, for trusted LAN devices only — bind it to a LAN
   interface with `SMTP_BIND_HOST=<lan-ip>` and never publish it to the internet.
 
